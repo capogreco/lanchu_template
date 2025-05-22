@@ -108,16 +108,27 @@ In this project, a Deno server (`server.js`) acts as the signaling intermediary.
     *   Click "Start Session" in the second tab. This tab becomes the "receiver".
     *   If signaling and ICE negotiation are successful, you should see your local video in one box and the remote video in the other. The chatbox should also become active.
 
-## Clearing Deno KV (for testing)
+## Clearing Deno KV (for testing and development)
 
-If you encounter issues with stale signaling data, you can clear the WebRTC entries for the `default-room` from Deno KV using the provided script:
+If you encounter issues with stale signaling data, or if WebRTC connections behave erratically (e.g., work once and then fail on subsequent attempts without a full browser cache clear and server restart), you might need to clear the WebRTC signaling entries from Deno KV.
 
-1.  Stop the main `server.js` if it's running.
-2.  Run:
+A Deno task is provided for this:
+
+1.  **Stop the main Deno server** (`server.js`) if it's currently running. This is important to avoid potential conflicts or race conditions if the server tries to access KV while you're clearing it.
+2.  Run the `clear-kv` task from the `lanchu_template` directory:
     ```bash
-    deno run --allow-read --allow-write --unstable-kv clear_kv.js
+    deno task clear-kv
     ```
-3.  Restart `server.js`.
+    This task executes the `clear_kv.js` script, which will remove all signaling data associated with the `default-room`.
+3.  After the script confirms deletion, you can restart the main Deno server (`deno task start`).
+
+**When to use `deno task clear-kv`:**
+
+*   Before starting a fresh testing session, especially if previous sessions ended abruptly or experienced connection issues.
+*   If you suspect stale offers, answers, or ICE candidates are interfering with new connection attempts.
+*   During development, if you've made changes to the signaling logic and want to ensure no old data structures are causing problems.
+
+This ensures a clean state for the signaling mechanism.
 
 ## Acknowledgement
 

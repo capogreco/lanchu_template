@@ -3,7 +3,8 @@
     "start": "deno run --allow-net --allow-read --allow-write --allow-env --unstable-kv server.js",
     "dev": "deno run --watch --allow-net --allow-read --allow-write --allow-env --unstable-kv server.js",
     "fmt": "deno fmt",
-    "lint": "deno lint"
+    "lint": "deno lint",
+    "clear-kv": "deno run --allow-read --allow-write --unstable-kv clear_kv.js"
   },
   "compilerOptions": {
     "lib": ["deno.ns", "deno.unstable"]
