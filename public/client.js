@@ -32,12 +32,11 @@ async function fetchIceServers() {
         await response.text(),
       );
       console.log("Using default fallback ICE configuration.");
-      // iceConfiguration remains the default
       return;
     }
     const servers = await response.json();
     if (servers && servers.length > 0) {
-      iceConfiguration.iceServers = servers; // Update the global configuration
+      iceConfiguration.iceServers = servers;
       console.log(
         "Successfully fetched and updated ICE configuration:",
         iceConfiguration.iceServers.map(s => s.urls).join(', ')
@@ -50,7 +49,6 @@ async function fetchIceServers() {
   } catch (error) {
     console.error("Error fetching ICE servers from API:", error);
     console.log("Using default fallback ICE configuration due to error.");
-    // iceConfiguration remains the default
   }
 }
 
@@ -70,7 +68,6 @@ async function startSession() {
   hangupButton.disabled = false;
 
   try {
-    // Fetch ICE servers before doing anything WebRTC related
     await fetchIceServers();
 
     console.log("Requesting local stream...");
@@ -81,7 +78,7 @@ async function startSession() {
     localVideo.srcObject = localStream;
     console.log("Received local stream.");
 
-    await createPeerConnection(); // Will use the (potentially updated) iceConfiguration
+    await createPeerConnection();
 
     const offerSignal = await getSignalMessage("offer");
 
@@ -115,25 +112,24 @@ async function startSession() {
   } catch (e) {
     console.error("Error starting WebRTC session:", e);
     alert("Could not start session: " + e.message);
-    hangUp(); // Reset UI and state
+    hangUp();
   }
 }
 
 function createPeerConnection() {
-  // Uses the iceConfiguration variable, which is fetched/updated in startSession
   peerConnection = new RTCPeerConnection(iceConfiguration);
   console.log("Created RTCPeerConnection with configuration:", JSON.stringify(iceConfiguration));
 
   peerConnection.onicecandidate = (event) => {
-    if (event.candidate && event.candidate.candidate) { // Check for actual candidate string
+    if (event.candidate && event.candidate.candidate) {
       console.log("Local ICE candidate gathered:", event.candidate.candidate.substring(0, 70) + "...");
       const candidateKey = isInitiator
-        ? "candidate_initiator"
-        : "candidate_receiver";
+        ? "candidate_initiator" // Server stores this as "candidates_for_receiver"
+        : "candidate_receiver";  // Server stores this as "candidates_for_initiator"
       sendSignalMessage(candidateKey, event.candidate);
-    } else if (!event.candidate) { // True end-of-candidates
+    } else if (!event.candidate) {
       console.log("All local ICE candidates gathered (end-of-candidates signal).");
-    } else { // Candidate object exists, but candidate string is empty
+    } else {
       console.log("Local ICE candidate gathered, but candidate string is empty. Not sending.", event.candidate);
     }
   };
@@ -164,7 +160,6 @@ function createPeerConnection() {
         peerConnection.iceConnectionState === "closed"
       ) {
         console.log("ICE connection disconnected or closed.");
-        // Potentially handle reconnections or notify user more explicitly
       }
     }
   };
@@ -276,20 +271,19 @@ async function hangUp() {
   chatInput.disabled = true;
   sendButton.disabled = true;
   
-  console.log("Attempting to clear all signals from server for this room...");
-  await clearSignalMessage("offer");
-  await clearSignalMessage("answer");
-  await clearSignalMessage("candidate_initiator");
-  await clearSignalMessage("candidate_receiver");
-
-  isInitiator = false; // Reset state
-  console.log("Session terminated and signals cleared.");
+  console.log("Attempting to clear offer/answer signals from server for this room...");
+  await clearSignalMessage("offer"); // For offer
+  await clearSignalMessage("answer"); // For answer
+  // Note: Candidate clearing in hangUp is now less effective as specific keys are needed.
+  // Individual candidates are cleared during polling. Aggressive cleanup here would require
+  // fetching all candidate keys for the room and deleting them, or a specific server endpoint.
+  console.log("Session terminated.");
+  isInitiator = false; 
 }
 
 
 async function sendSignalMessage(type, payload) {
   try {
-    // console.log(`Sending signal: ${type}`, payload); // Full payload can be verbose for candidates
     console.log(`Sending signal type: ${type} to /signal`);
     const response = await fetch(`/signal?room=${ROOM_ID}`, {
       method: "POST",
@@ -303,8 +297,7 @@ async function sendSignalMessage(type, payload) {
         await response.text(),
       );
     }
-  } catch (error)
- {
+  } catch (error) {
     console.error(`Error sending signal message ${type}:`, error);
   }
 }
@@ -314,22 +307,28 @@ async function getSignalMessage(type) {
     const response = await fetch(`/signal?room=${ROOM_ID}&type=${type}`);
     if (response.ok) {
       const data = await response.json(); 
-      console.log(`Received signal for ${type} from /signal:`, data ? data.type : 'null');
+      // For candidates, data will be an array. For offer/answer, an object or null.
+      if (type.startsWith("candidate_")) {
+        console.log(`Received ${data ? data.length : 0} ${type} signals from /signal.`);
+      } else {
+        console.log(`Received signal for ${type} from /signal:`, data ? data.type : 'null');
+      }
       return data; 
     }
     if (response.status === 404) {
+      // For candidates, an empty array is returned by server for "not found", so 404 is usually for offer/answer
       console.log(`No signal message of type ${type} found on server (404).`);
-      return null;
+      return type.startsWith("candidate_") ? [] : null; // Return empty array for candidate types if 404
     }
     console.error(
       `Failed to get signal message ${type} from server:`,
       response.status,
       await response.text(),
     );
-    return null;
+    return type.startsWith("candidate_") ? [] : null; // Fallback to empty array for candidates on error
   } catch (error) {
     console.error(`Error fetching signal message ${type} from server:`, error);
-    return null;
+    return type.startsWith("candidate_") ? [] : null; // Fallback to empty array for candidates on error
   }
 }
 
@@ -343,43 +342,50 @@ async function pollForSignalMessages() {
   }
 
   try {
-    if (isInitiator) {
+    if (isInitiator) { // Initiator polls for answers and receiver's candidates
       if (!peerConnection.remoteDescription) {
-        const answerSignal = await getSignalMessage("answer");
+        const answerSignal = await getSignalMessage("answer"); // Expects single object
         if (answerSignal && answerSignal.payload) {
           console.log("Initiator received answer:", answerSignal.payload.type);
           await peerConnection.setRemoteDescription(
             new RTCSessionDescription(answerSignal.payload),
           );
-          await clearSignalMessage("answer");
+          await clearSignalMessage("answer"); // Clear by type
         }
       }
-      const candidateSignal = await getSignalMessage("candidate_receiver");
-      if (candidateSignal && candidateSignal.payload) {
-        console.log("Initiator received candidate_receiver signal payload:", JSON.stringify(candidateSignal.payload));
-        if (candidateSignal.payload.candidate) { // Check for actual candidate string
-          console.log("Initiator adding ICE candidate:", candidateSignal.payload.candidate.substring(0,70) + "...");
-          await peerConnection.addIceCandidate(
-            new RTCIceCandidate(candidateSignal.payload),
-          );
-          // await clearSignalMessage("candidate_receiver"); // TEMPORARILY COMMENTED OUT
-        } else {
-          console.warn("Initiator received candidate_receiver signal, but payload.candidate is empty. Skipping addIceCandidate.", candidateSignal.payload);
+      
+      // Initiator asks for candidates sent by receiver ("candidate_receiver" type on client, "candidates_for_initiator" on server)
+      const receiverCandidates = await getSignalMessage("candidate_receiver"); // Expects array
+      if (Array.isArray(receiverCandidates)) {
+        for (const candidateEntry of receiverCandidates) {
+          if (candidateEntry.payload && candidateEntry.payload.candidate) {
+            console.log("Initiator adding remote (receiver's) ICE candidate:", candidateEntry.payload.candidate.substring(0,70) + "...");
+            await peerConnection.addIceCandidate(
+              new RTCIceCandidate(candidateEntry.payload),
+            );
+            await clearSignalMessage(null, JSON.stringify(candidateEntry.key)); // Clear specific candidate by its full KV key
+          } else {
+            console.warn("Initiator received receiver's candidate signal, but payload or candidate string is empty. Skipping.", candidateEntry);
+            // Still try to clear it if it has a key, as it's an invalid entry from server perspective
+            if(candidateEntry.key) await clearSignalMessage(null, JSON.stringify(candidateEntry.key));
+          }
         }
       }
-    } else {
-      // Receiver looks for initiator\'s candidates
-      const candidateSignal = await getSignalMessage("candidate_initiator");
-      if (candidateSignal && candidateSignal.payload) {
-        console.log("Receiver received candidate_initiator signal payload:", JSON.stringify(candidateSignal.payload));
-        if (candidateSignal.payload.candidate) { // Check for actual candidate string
-          console.log("Receiver adding ICE candidate:", candidateSignal.payload.candidate.substring(0,70) + "...");
-          await peerConnection.addIceCandidate(
-            new RTCIceCandidate(candidateSignal.payload),
-          );
-          // await clearSignalMessage("candidate_initiator"); // TEMPORARILY COMMENTED OUT
-        } else {
-          console.warn("Receiver received candidate_initiator signal, but payload.candidate is empty. Skipping addIceCandidate.", candidateSignal.payload);
+    } else { // Receiver polls for initiator's candidates
+      // Receiver asks for candidates sent by initiator ("candidate_initiator" type on client, "candidates_for_receiver" on server)
+      const initiatorCandidates = await getSignalMessage("candidate_initiator"); // Expects array
+      if (Array.isArray(initiatorCandidates)) {
+        for (const candidateEntry of initiatorCandidates) {
+          if (candidateEntry.payload && candidateEntry.payload.candidate) {
+            console.log("Receiver adding remote (initiator's) ICE candidate:", candidateEntry.payload.candidate.substring(0,70) + "...");
+            await peerConnection.addIceCandidate(
+              new RTCIceCandidate(candidateEntry.payload),
+            );
+            await clearSignalMessage(null, JSON.stringify(candidateEntry.key)); // Clear specific candidate by its full KV key
+          } else {
+            console.warn("Receiver received initiator's candidate signal, but payload or candidate string is empty. Skipping.", candidateEntry);
+            if(candidateEntry.key) await clearSignalMessage(null, JSON.stringify(candidateEntry.key));
+          }
         }
       }
     }
@@ -392,27 +398,38 @@ async function pollForSignalMessages() {
     peerConnection.signalingState !== "closed" &&
     !hangupButton.disabled
   ) {
-    setTimeout(pollForSignalMessages, 3000); // Poll every 3 seconds
+    setTimeout(pollForSignalMessages, 2000); // Poll slightly more frequently
   }
 }
 
-async function clearSignalMessage(type) {
+async function clearSignalMessage(type, candidateKeyString = null) {
   try {
-    console.log(`Requesting to clear signal type: ${type} on server.`);
-    const response = await fetch(`/signal?room=${ROOM_ID}&type=${type}`, {
-      method: "DELETE",
-    });
+    let url = `/signal?room=${ROOM_ID}`;
+    if (candidateKeyString) {
+      // Deleting a specific candidate by its full Deno KV key
+      url += `&candidateKey=${encodeURIComponent(candidateKeyString)}`;
+      console.log(`Requesting to clear specific candidate on server. Key: ${candidateKeyString}`);
+    } else if (type) {
+      // Deleting an offer or answer by type
+      url += `&type=${type}`;
+      console.log(`Requesting to clear signal type: ${type} on server.`);
+    } else {
+      console.warn("clearSignalMessage called without type or candidateKeyString.");
+      return;
+    }
+
+    const response = await fetch(url, { method: "DELETE" });
     if (!response.ok && response.status !== 404) {
       console.error(
-        `Failed to clear signal message ${type} on server:`,
+        `Failed to clear signal message on server: ${type || candidateKeyString}`,
         response.status,
         await response.text(),
       );
     } else {
-      console.log(`Signal message ${type} cleared on server (or was not present).`);
+      console.log(`Signal message ${type || candidateKeyString} cleared on server (or was not present).`);
     }
   } catch (error) {
-    console.error(`Error clearing signal message ${type} on server:`, error);
+    console.error(`Error clearing signal message ${type || candidateKeyString} on server:`, error);
   }
 }
 

@@ -54,7 +54,6 @@ async function fetchTwilioIceServers() {
         Authorization:
           "Basic " + btoa(`${twilioAccountSid}:${twilioAuthToken}`),
       },
-      // Optionally, you can specify a TTL for the token, e.g., body: "Ttl=3600" for 1 hour
     });
 
     if (!response.ok) {
@@ -65,10 +64,6 @@ async function fetchTwilioIceServers() {
     }
 
     const data = await response.json();
-    // console.log("Twilio API response:", data); // For debugging
-    // Twilio's response directly contains an ice_servers array.
-    // Filter out any non-WebRTC useful servers if necessary, though Twilio's are usually fine.
-    // Also add Google's STUN server as a common practice, though Twilio's list might already include STUN.
     const iceServers = [
       { urls: "stun:stun.l.google.com:19302" },
       ...data.ice_servers,
@@ -80,7 +75,7 @@ async function fetchTwilioIceServers() {
     return iceServers;
   } catch (error) {
     console.error("Error fetching ICE servers from Twilio:", error);
-    return [{ urls: "stun:stun.l.google.com:19302" }]; // Fallback in case of network error
+    return [{ urls: "stun:stun.l.google.com:19302" }];
   }
 }
 
@@ -91,7 +86,6 @@ async function handler(req) {
 
   console.log(`${method} ${pathname}`);
 
-  // New endpoint for ICE servers
   if (pathname === "/api/ice-servers" && method === "GET") {
     try {
       const iceServers = await fetchTwilioIceServers();
@@ -107,10 +101,10 @@ async function handler(req) {
     }
   }
 
-  // Signaling endpoint
   if (pathname === "/signal" && kv) {
     const room = url.searchParams.get("room") || "default-room";
-    const type = url.searchParams.get("type");
+    const type = url.searchParams.get("type"); // For GET/DELETE of offer/answer, or to identify candidate type
+    const candidateKeyParam = url.searchParams.get("candidateKey"); // For DELETE of specific candidate
 
     if (!room) {
       return new Response("Missing 'room' query parameter", { status: 400 });
@@ -118,19 +112,31 @@ async function handler(req) {
 
     if (method === "POST") {
       try {
-        const signal = await req.json();
-        if (!signal.type || !signal.payload) {
+        const signal = await req.json(); // Expects { type, payload }
+        if (!signal.type || signal.payload === undefined) { // payload can be null for end-of-candidates marker if we were to send it
           return new Response(
             "Invalid signal data. Expected { type, payload }.",
             { status: 400 },
           );
         }
-        // Add server-side logging for candidate payloads
-        if (signal.type.startsWith("candidate_")) {
-          console.log(`Storing candidate. Type: ${signal.type}, Payload: ${JSON.stringify(signal.payload)}`);
+
+        let kvKey;
+        if (signal.type === "offer" || signal.type === "answer") {
+          kvKey = ["webrtc_signal", room, signal.type];
+          await kv.set(kvKey, signal.payload);
+          console.log(`Stored ${signal.type} for room '${room}'`);
+        } else if (signal.type === "candidate_initiator") { // Candidate from initiator, for receiver
+          kvKey = ["webrtc_signal", room, "candidates_for_receiver", crypto.randomUUID()];
+          await kv.set(kvKey, signal.payload);
+          console.log(`Stored initiator candidate for room '${room}', key: ${kvKey[3]}`);
+        } else if (signal.type === "candidate_receiver") { // Candidate from receiver, for initiator
+          kvKey = ["webrtc_signal", room, "candidates_for_initiator", crypto.randomUUID()];
+          await kv.set(kvKey, signal.payload);
+          console.log(`Stored receiver candidate for room '${room}', key: ${kvKey[3]}`);
+        } else {
+          return new Response("Invalid signal type for POST", { status: 400 });
         }
-        await kv.set(["webrtc_signal", room, signal.type], signal.payload);
-        console.log(`Stored signal for room '${room}', type '${signal.type}'`);
+        
         return new Response(JSON.stringify({ message: "Signal stored" }), {
           status: 200,
           headers: { "Content-Type": "application/json" },
@@ -143,53 +149,74 @@ async function handler(req) {
       }
     } else if (method === "GET") {
       if (!type) {
-        return new Response("Missing 'type' query parameter for GET request", {
-          status: 400,
-        });
+        return new Response("Missing 'type' query parameter for GET request", { status: 400 });
       }
       try {
-        const kvEntry = await kv.get(["webrtc_signal", room, type]);
-        if (kvEntry && kvEntry.value !== null) {
-          console.log(`Retrieved signal for room '${room}', type '${type}'`);
-          return new Response(
-            JSON.stringify({ type: type, payload: kvEntry.value }),
-            {
-              status: 200,
-              headers: { "Content-Type": "application/json" },
-            },
-          );
-        } else {
-          console.log(`No signal found for room '${room}', type '${type}'`);
-          return new Response(JSON.stringify(null), {
-            status: 404,
-            headers: { "Content-Type": "application/json" },
+        if (type === "offer" || type === "answer") {
+          const kvEntry = await kv.get(["webrtc_signal", room, type]);
+          if (kvEntry && kvEntry.value !== null) {
+            console.log(`Retrieved ${type} for room '${room}'`);
+            return new Response(
+              JSON.stringify({ type: type, payload: kvEntry.value }),
+              { status: 200, headers: { "Content-Type": "application/json" } },
+            );
+          }
+        } else if (type === "candidate_initiator") { // Receiver is asking for initiator's candidates
+          const candidates = [];
+          const prefix = ["webrtc_signal", room, "candidates_for_receiver"];
+          for await (const entry of kv.list({ prefix })) {
+            candidates.push({ payload: entry.value, key: entry.key });
+          }
+          console.log(`Retrieved ${candidates.length} initiator candidates for room '${room}'`);
+          return new Response(JSON.stringify(candidates), { // Return as an array
+            status: 200, headers: { "Content-Type": "application/json" },
           });
+        } else if (type === "candidate_receiver") { // Initiator is asking for receiver's candidates
+          const candidates = [];
+          const prefix = ["webrtc_signal", room, "candidates_for_initiator"];
+          for await (const entry of kv.list({ prefix })) {
+            candidates.push({ payload: entry.value, key: entry.key });
+          }
+          console.log(`Retrieved ${candidates.length} receiver candidates for room '${room}'`);
+          return new Response(JSON.stringify(candidates), { // Return as an array
+            status: 200, headers: { "Content-Type": "application/json" },
+          });
+        } else {
+           return new Response("Invalid type for GET request", { status: 400 });
         }
+        // If offer/answer not found or no candidates
+        console.log(`No signal found for room '${room}', type '${type}'`);
+        return new Response(JSON.stringify(type.startsWith("candidate") ? [] : null), { // Empty array for candidates, null for offer/answer
+          status: 404, headers: { "Content-Type": "application/json" },
+        });
       } catch (error) {
         console.error("Error processing GET /signal:", error);
-        return new Response("Error retrieving signal: " + error.message, {
-          status: 500,
-        });
+        return new Response("Error retrieving signal: " + error.message, { status: 500 });
       }
     } else if (method === "DELETE") {
-      if (!type) {
-        return new Response(
-          "Missing 'type' query parameter for DELETE request",
-          { status: 400 },
-        );
-      }
       try {
-        await kv.delete(["webrtc_signal", room, type]);
-        console.log(`Deleted signal for room '${room}', type '${type}'`);
-        return new Response(
-          JSON.stringify({ message: `Signal type '${type}' deleted` }),
-          { status: 200, headers: { "Content-Type": "application/json" } },
-        );
+        if (candidateKeyParam) { // Deleting a specific candidate
+          const parsedKey = JSON.parse(candidateKeyParam); // Key was stringified by client
+          await kv.delete(parsedKey);
+          console.log(`Deleted candidate with key ${candidateKeyParam} for room '${room}'`);
+          return new Response(JSON.stringify({ message: "Candidate deleted" }), { status: 200 });
+        } else if (type === "offer" || type === "answer") { // Deleting offer or answer
+           if (!type) {
+                return new Response("Missing 'type' query parameter for DELETE request of offer/answer", { status: 400 });
+            }
+          await kv.delete(["webrtc_signal", room, type]);
+          console.log(`Deleted ${type} for room '${room}'`);
+          return new Response(JSON.stringify({ message: `${type} deleted` }), { status: 200 });
+        } else {
+            // Note: We don't have a bulk delete for candidate types by just "type" anymore.
+            // Client must delete specific candidates by their full key.
+            // Or, for robust cleanup on hangup, client could iterate and delete, or server could have a special cleanup endpoint.
+            console.warn(`DELETE request for type '${type}' without specific candidateKey not supported for bulk candidate deletion.`);
+            return new Response("Invalid DELETE request. Must specify candidateKey for candidates, or type for offer/answer.", { status: 400 });
+        }
       } catch (error) {
         console.error("Error processing DELETE /signal:", error);
-        return new Response("Error deleting signal: " + error.message, {
-          status: 500,
-        });
+        return new Response("Error deleting signal: " + error.message, { status: 500 });
       }
     } else {
       return new Response("Method not allowed for /signal", { status: 405 });
@@ -201,7 +228,7 @@ async function handler(req) {
     );
   }
 
-  // Serve static files from the public directory
+  // Serve static files
   try {
     const publicDirPath = Deno.realPathSync(PUBLIC_DIR_PATH);
     return await serveDir(req, {
