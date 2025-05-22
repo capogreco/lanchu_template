@@ -1,5 +1,14 @@
 {
   "version": "4",
+  "specifiers": {
+    "jsr:@std/dotenv@*": "0.225.4",
+    "jsr:@std/dotenv@~0.225.4": "0.225.4"
+  },
+  "jsr": {
+    "@std/dotenv@0.225.4": {
+      "integrity": "2a672c2b192abe535dcfea1ae89f219ee3979af6aad7d185cb19206ee9bc5caf"
+    }
+  },
   "remote": {
     "https://deno.land/std@0.190.0/_util/asserts.ts": "178dfc49a464aee693a7e285567b3d0b555dc805ff490505a8aae34f9cfb1462",
     "https://deno.land/std@0.190.0/_util/os.ts": "d932f56d41e4f6a6093d56044e29ce637f8dcc43c5a90af43504a889cf1775e3",
@@ -15,6 +24,9 @@
     "https://deno.land/std@0.190.0/async/tee.ts": "47e42d35f622650b02234d43803d0383a89eb4387e1b83b5a40106d18ae36757",
     "https://deno.land/std@0.190.0/collections/_utils.ts": "5114abc026ddef71207a79609b984614e66a63a4bda17d819d56b0e72c51527e",
     "https://deno.land/std@0.190.0/collections/deep_merge.ts": "5a8ed29030f4471a5272785c57c3455fa79697b9a8f306013a8feae12bafc99a",
+    "https://deno.land/std@0.190.0/collections/filter_values.ts": "5b9feaf17b9a6e5ffccdd36cf6f38fa4ffa94cff2602d381c2ad0c2a97929652",
+    "https://deno.land/std@0.190.0/collections/without_all.ts": "a89f5da0b5830defed4f59666e188df411d8fece35a5f6ca69be6ca71a95c185",
+    "https://deno.land/std@0.190.0/dotenv/mod.ts": "f5a8123741d1561ae8184a7f043bc097b15132c5171c651142b804b6dbc21853",
     "https://deno.land/std@0.190.0/encoding/base64.ts": "144ae6234c1fbe5b68666c711dc15b1e9ee2aef6d42b3b4345bf9a6c91d70d0d",
     "https://deno.land/std@0.190.0/flags/mod.ts": "17f444ddbee43c5487568de0c6a076c7729cfe90d96d2ffcd2b8f8adadafb6e8",
     "https://deno.land/std@0.190.0/fmt/bytes.ts": "f29cf69e0791d375f9f5d94ae1f0641e5a03b975f32ddf86d70f70fdf37e7b6a",
@@ -43,5 +55,10 @@
     "https://deno.land/std@0.190.0/path/win32.ts": "d186344e5583bcbf8b18af416d13d82b35a317116e6460a5a3953508c3de5bba",
     "https://deno.land/std@0.190.0/streams/byte_slice_stream.ts": "225d57263a34325d7c96cb3dafeb478eec0e6fd05cd0458d678752eadd132bb4",
     "https://deno.land/std@0.190.0/version.ts": "c3fdbeb886289441c29bb900612bb35815659717391f631be2c14a34fca40c52"
+  },
+  "workspace": {
+    "dependencies": [
+      "jsr:@std/dotenv@~0.225.4"
+    ]
   }
 }

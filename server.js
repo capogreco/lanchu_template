@@ -1,22 +1,87 @@
 import { serve } from "https://deno.land/std@0.190.0/http/server.ts";
 import { serveDir } from "https://deno.land/std@0.190.0/http/file_server.ts";
+import { load } from "jsr:@std/dotenv";
 
 const PORT = 8000;
 const PUBLIC_DIR_PATH = "./public"; // Relative to where server.js is
 
 let kv;
+let twilioAccountSid;
+let twilioAuthToken;
+
 try {
+  // Load environment variables from .env file
+  await load({ export: true }); // Exports to Deno.env
+  twilioAccountSid = Deno.env.get("TWILIO_ACCOUNT_SID");
+  twilioAuthToken = Deno.env.get("TWILIO_AUTH_TOKEN");
+
+  if (!twilioAccountSid || !twilioAuthToken) {
+    console.warn(
+      "Twilio credentials (TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) not found in .env file. TURN server functionality will be disabled.",
+    );
+  } else {
+    console.log("Twilio credentials loaded successfully.");
+  }
+
   kv = await Deno.openKv();
   console.log("Deno KV store opened successfully.");
 } catch (error) {
-  console.error("Failed to open Deno KV store:", error);
-  console.warn(
-    "Signaling will not work. Ensure Deno KV is enabled and permissions are correct.",
-  );
-  console.warn(
-    "Run with: deno run --allow-net --allow-read --allow-write --unstable server.js",
-  );
-  // Deno.exit(1); // Optionally exit if KV is critical and not available
+  console.error("Failed during initial setup (Deno KV or Env Vars):", error);
+  if (error.name === "PermissionDenied") {
+    console.warn(
+      "Ensure Deno has correct permissions. Run with: deno run --allow-net --allow-read --allow-write --allow-env --unstable-kv server.js",
+    );
+  } else {
+    console.warn(
+      "Signaling or TURN services might not work. Ensure Deno KV is enabled and .env file is present with correct permissions.",
+    );
+  }
+}
+
+async function fetchTwilioIceServers() {
+  if (!twilioAccountSid || !twilioAuthToken) {
+    console.log(
+      "Twilio credentials not available, returning only public STUN.",
+    );
+    return [{ urls: "stun:stun.l.google.com:19302" }]; // Fallback or default
+  }
+
+  const twilioApiUrl = `https://api.twilio.com/2010-04-01/Accounts/${twilioAccountSid}/Tokens.json`;
+  try {
+    const response = await fetch(twilioApiUrl, {
+      method: "POST",
+      headers: {
+        Authorization:
+          "Basic " + btoa(`${twilioAccountSid}:${twilioAuthToken}`),
+      },
+      // Optionally, you can specify a TTL for the token, e.g., body: "Ttl=3600" for 1 hour
+    });
+
+    if (!response.ok) {
+      console.error(
+        `Failed to fetch ICE servers from Twilio: ${response.status} ${await response.text()}`,
+      );
+      return [{ urls: "stun:stun.l.google.com:19302" }]; // Fallback
+    }
+
+    const data = await response.json();
+    // console.log("Twilio API response:", data); // For debugging
+    // Twilio's response directly contains an ice_servers array.
+    // Filter out any non-WebRTC useful servers if necessary, though Twilio's are usually fine.
+    // Also add Google's STUN server as a common practice, though Twilio's list might already include STUN.
+    const iceServers = [
+      { urls: "stun:stun.l.google.com:19302" },
+      ...data.ice_servers,
+    ];
+    console.log(
+      "Fetched ICE servers from Twilio:",
+      iceServers.map((s) => s.urls),
+    );
+    return iceServers;
+  } catch (error) {
+    console.error("Error fetching ICE servers from Twilio:", error);
+    return [{ urls: "stun:stun.l.google.com:19302" }]; // Fallback in case of network error
+  }
 }
 
 async function handler(req) {
@@ -26,10 +91,26 @@ async function handler(req) {
 
   console.log(`${method} ${pathname}`);
 
+  // New endpoint for ICE servers
+  if (pathname === "/api/ice-servers" && method === "GET") {
+    try {
+      const iceServers = await fetchTwilioIceServers();
+      return new Response(JSON.stringify(iceServers), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    } catch (error) {
+      console.error("Error providing ICE servers:", error);
+      return new Response("Error fetching ICE server configuration", {
+        status: 500,
+      });
+    }
+  }
+
   // Signaling endpoint
   if (pathname === "/signal" && kv) {
     const room = url.searchParams.get("room") || "default-room";
-    const type = url.searchParams.get("type"); // e.g., 'offer', 'answer', 'candidate_initiator', 'candidate_receiver'
+    const type = url.searchParams.get("type");
 
     if (!room) {
       return new Response("Missing 'room' query parameter", { status: 400 });
@@ -37,15 +118,17 @@ async function handler(req) {
 
     if (method === "POST") {
       try {
-        const signal = await req.json(); // Expects { type, payload }
+        const signal = await req.json();
         if (!signal.type || !signal.payload) {
           return new Response(
             "Invalid signal data. Expected { type, payload }.",
             { status: 400 },
           );
         }
-        // Store the payload under a key that includes the room and the specific signal type
-        // This allows multiple signal types (offer, answer, candidates) per room.
+        // Add server-side logging for candidate payloads
+        if (signal.type.startsWith("candidate_")) {
+          console.log(`Storing candidate. Type: ${signal.type}, Payload: ${JSON.stringify(signal.payload)}`);
+        }
         await kv.set(["webrtc_signal", room, signal.type], signal.payload);
         console.log(`Stored signal for room '${room}', type '${signal.type}'`);
         return new Response(JSON.stringify({ message: "Signal stored" }), {
@@ -68,7 +151,6 @@ async function handler(req) {
         const kvEntry = await kv.get(["webrtc_signal", room, type]);
         if (kvEntry && kvEntry.value !== null) {
           console.log(`Retrieved signal for room '${room}', type '${type}'`);
-          // Return the payload directly, wrapped in the expected { type, payload } structure
           return new Response(
             JSON.stringify({ type: type, payload: kvEntry.value }),
             {
@@ -122,16 +204,14 @@ async function handler(req) {
   // Serve static files from the public directory
   try {
     const publicDirPath = Deno.realPathSync(PUBLIC_DIR_PATH);
-    const response = await serveDir(req, {
+    return await serveDir(req, {
       fsRoot: publicDirPath,
-      urlRoot: "", // Serve from the root of the domain
-      showDirListing: true, // Optional: for debugging
-      enableCors: true, // Optional: enable CORS if needed
+      urlRoot: "",
+      showDirListing: true,
+      enableCors: true,
     });
-    return response;
   } catch (error) {
     console.error(`Error serving static file ${pathname}:`, error);
-    // Basic error response, can be enhanced
     if (error instanceof Deno.errors.NotFound) {
       return new Response("Not Found", { status: 404 });
     }

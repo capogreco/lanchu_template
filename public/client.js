@@ -15,10 +15,44 @@ let isInitiator = false;
 
 const ROOM_ID = "default-room"; // Simple room ID for Deno KV signaling
 
-// STUN server configuration (Google's public STUN server)
-const configuration = {
+// Global ICE configuration, starts with a fallback
+let iceConfiguration = {
   iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
 };
+
+// --- Fetch ICE Servers ---
+async function fetchIceServers() {
+  console.log("Fetching ICE servers from /api/ice-servers...");
+  try {
+    const response = await fetch("/api/ice-servers");
+    if (!response.ok) {
+      console.error(
+        "Failed to fetch ICE servers from API:",
+        response.status,
+        await response.text(),
+      );
+      console.log("Using default fallback ICE configuration.");
+      // iceConfiguration remains the default
+      return;
+    }
+    const servers = await response.json();
+    if (servers && servers.length > 0) {
+      iceConfiguration.iceServers = servers; // Update the global configuration
+      console.log(
+        "Successfully fetched and updated ICE configuration:",
+        iceConfiguration.iceServers.map(s => s.urls).join(', ')
+      );
+    } else {
+      console.warn(
+        "Fetched ICE servers list from API is empty, using default fallback.",
+      );
+    }
+  } catch (error) {
+    console.error("Error fetching ICE servers from API:", error);
+    console.log("Using default fallback ICE configuration due to error.");
+    // iceConfiguration remains the default
+  }
+}
 
 // --- Initialization and Event Listeners ---
 startButton.addEventListener("click", startSession);
@@ -31,114 +65,131 @@ chatInput.addEventListener("keypress", (event) => {
 });
 
 async function startSession() {
-  console.log("Requesting local stream");
+  console.log("Attempting to start session...");
   startButton.disabled = true;
   hangupButton.disabled = false;
 
   try {
+    // Fetch ICE servers before doing anything WebRTC related
+    await fetchIceServers();
+
+    console.log("Requesting local stream...");
     localStream = await navigator.mediaDevices.getUserMedia({
       audio: true,
       video: true,
     });
     localVideo.srcObject = localStream;
-    console.log("Received local stream");
+    console.log("Received local stream.");
 
-    await createPeerConnection();
+    await createPeerConnection(); // Will use the (potentially updated) iceConfiguration
 
-    // Attempt to fetch existing offer to decide if we are initiator
-    const offerSignal = await getSignalMessage("offer"); // Fetches { type: 'offer', payload: sdp }
+    const offerSignal = await getSignalMessage("offer");
 
     if (!offerSignal || !offerSignal.payload) {
-      // If no offer exists, we are the initiator
       isInitiator = true;
-      console.log("I am the initiator.");
-      // Create offer
+      console.log("This client is the initiator.");
       if (peerConnection) {
+        console.log("Creating offer...");
         const offerSdp = await peerConnection.createOffer();
         await peerConnection.setLocalDescription(offerSdp);
         await sendSignalMessage("offer", offerSdp);
-        console.log("Sent offer:", offerSdp);
+        console.log("Sent offer to signaling server.");
       }
     } else {
-      // An offer exists, we are the receiver
       isInitiator = false;
-      console.log("I am the receiver. Got offer:", offerSignal.payload);
+      console.log("This client is the receiver. Got offer from signaling server:", offerSignal.payload.type);
       if (peerConnection) {
         await peerConnection.setRemoteDescription(
           new RTCSessionDescription(offerSignal.payload),
         );
+        console.log("Set remote description from offer. Creating answer...");
         const answerSdp = await peerConnection.createAnswer();
         await peerConnection.setLocalDescription(answerSdp);
         await sendSignalMessage("answer", answerSdp);
-        console.log("Sent answer:", answerSdp);
-        await clearSignalMessage("offer"); // Clear the offer from the server once used
+        console.log("Sent answer to signaling server.");
+        await clearSignalMessage("offer");
       }
     }
 
-    pollForSignalMessages(); // Start polling for answer/candidates
+    pollForSignalMessages();
   } catch (e) {
-    console.error("Error starting session:", e);
+    console.error("Error starting WebRTC session:", e);
     alert("Could not start session: " + e.message);
-    hangUp(); // Reset UI
+    hangUp(); // Reset UI and state
   }
 }
 
 function createPeerConnection() {
-  peerConnection = new RTCPeerConnection(configuration);
-  console.log("Created RTCPeerConnection");
+  // Uses the iceConfiguration variable, which is fetched/updated in startSession
+  peerConnection = new RTCPeerConnection(iceConfiguration);
+  console.log("Created RTCPeerConnection with configuration:", JSON.stringify(iceConfiguration));
 
   peerConnection.onicecandidate = (event) => {
-    if (event.candidate) {
-      console.log("Sending ICE candidate:", event.candidate);
-      // Send candidate with role distinction
+    if (event.candidate && event.candidate.candidate) { // Check for actual candidate string
+      console.log("Local ICE candidate gathered:", event.candidate.candidate.substring(0, 70) + "...");
       const candidateKey = isInitiator
         ? "candidate_initiator"
         : "candidate_receiver";
       sendSignalMessage(candidateKey, event.candidate);
+    } else if (!event.candidate) { // True end-of-candidates
+      console.log("All local ICE candidates gathered (end-of-candidates signal).");
+    } else { // Candidate object exists, but candidate string is empty
+      console.log("Local ICE candidate gathered, but candidate string is empty. Not sending.", event.candidate);
     }
   };
 
   peerConnection.ontrack = (event) => {
-    console.log("Received remote track");
+    console.log("Remote track received:", event.track.kind);
     if (remoteVideo.srcObject !== event.streams[0]) {
       remoteVideo.srcObject = event.streams[0];
       remoteStream = event.streams[0];
-      console.log("Remote stream added.");
+      console.log("Remote stream added to video element.");
     }
   };
 
   peerConnection.oniceconnectionstatechange = () => {
     if (peerConnection) {
       console.log(
-        "ICE connection state change:",
+        "ICE connection state changed to:",
         peerConnection.iceConnectionState,
       );
+      if (peerConnection.iceConnectionState === "failed") {
+          console.error("ICE connection failed. Check STUN/TURN server and network.");
+      }
+      if (peerConnection.iceConnectionState === "connected") {
+          console.log("ICE connection established successfully!");
+      }
       if (
-        peerConnection.iceConnectionState === "failed" ||
         peerConnection.iceConnectionState === "disconnected" ||
         peerConnection.iceConnectionState === "closed"
       ) {
-        // Potentially handle reconnections or notify user
+        console.log("ICE connection disconnected or closed.");
+        // Potentially handle reconnections or notify user more explicitly
       }
     }
   };
+  
+  peerConnection.onsignalingstatechange = () => {
+    if (peerConnection) {
+      console.log("Signaling state changed to:", peerConnection.signalingState);
+    }
+  };
 
-  // Add local tracks to the peer connection
   if (localStream) {
     localStream.getTracks().forEach((track) => {
+      console.log("Adding local track to PeerConnection:", track.kind);
       peerConnection.addTrack(track, localStream);
     });
-    console.log("Added local stream to peerConnection");
+    console.log("Finished adding local stream tracks to PeerConnection.");
   }
 
-  // Data Channel for chat
   if (isInitiator) {
-    console.log("Creating data channel as initiator");
+    console.log("Initiator creating data channel 'chat'.");
     dataChannel = peerConnection.createDataChannel("chat");
     setupDataChannelEvents(dataChannel);
   } else {
     peerConnection.ondatachannel = (event) => {
-      console.log("Received data channel as receiver");
+      console.log("Receiver received data channel 'chat'.");
       dataChannel = event.channel;
       setupDataChannelEvents(dataChannel);
     };
@@ -147,24 +198,24 @@ function createPeerConnection() {
 
 function setupDataChannelEvents(channel) {
   channel.onopen = () => {
-    console.log("Data channel open");
+    console.log(`Data channel '${channel.label}' is open.`);
     chatInput.disabled = false;
     sendButton.disabled = false;
     displayChatMessage("System", "Chat connected!");
   };
   channel.onclose = () => {
-    console.log("Data channel closed");
+    console.log(`Data channel '${channel.label}' is closed.`);
     chatInput.disabled = true;
     sendButton.disabled = true;
     displayChatMessage("System", "Chat disconnected.");
   };
   channel.onmessage = (event) => {
-    console.log("Message received:", event.data);
+    console.log(`Message received on data channel: ${event.data.substring(0,50)}...`);
     try {
-      const messageData = JSON.parse(event.data); // Assuming messages are JSON strings
+      const messageData = JSON.parse(event.data); 
       displayChatMessage(messageData.sender || "Remote", messageData.message);
     } catch (_e) {
-      displayChatMessage("Remote (raw)", event.data); // Fallback for non-JSON messages
+      displayChatMessage("Remote (raw)", event.data); 
     }
   };
   channel.onerror = (error) => {
@@ -176,7 +227,7 @@ function sendMessage() {
   const messageText = chatInput.value;
   if (messageText && dataChannel && dataChannel.readyState === "open") {
     const messagePayload = {
-      sender: "Local", // Or a user-defined name
+      sender: "Local", 
       message: messageText,
     };
     dataChannel.send(JSON.stringify(messagePayload));
@@ -193,11 +244,11 @@ function displayChatMessage(sender, message) {
   const p = document.createElement("p");
   p.textContent = `[${sender}]: ${message}`;
   chatLog.appendChild(p);
-  chatLog.scrollTop = chatLog.scrollHeight; // Scroll to bottom
+  chatLog.scrollTop = chatLog.scrollHeight; 
 }
 
 async function hangUp() {
-  console.log("Hanging up.");
+  console.log("Hanging up session...");
   if (peerConnection) {
     peerConnection.close();
     peerConnection = null;
@@ -205,10 +256,10 @@ async function hangUp() {
   if (localStream) {
     localStream.getTracks().forEach((track) => track.stop());
   }
-  localStream = null; // Ensure it's nulled after stopping tracks
+  localStream = null;
 
   if (remoteStream) {
-    remoteStream.getTracks().forEach((track) => track.stop()); // Also stop remote tracks if needed
+    remoteStream.getTracks().forEach((track) => track.stop()); 
   }
   remoteStream = null;
 
@@ -224,30 +275,26 @@ async function hangUp() {
   hangupButton.disabled = true;
   chatInput.disabled = true;
   sendButton.disabled = true;
-  // chatLog.innerHTML = ''; // Keep chat log for review, or clear if preferred
-
-  // Clear all relevant signals from server for this room
-  // This is a bit aggressive but ensures cleanup for a simple setup.
-  // A more robust system might have session IDs.
-  console.log("Attempting to clear signals from server...");
+  
+  console.log("Attempting to clear all signals from server for this room...");
   await clearSignalMessage("offer");
   await clearSignalMessage("answer");
   await clearSignalMessage("candidate_initiator");
   await clearSignalMessage("candidate_receiver");
 
   isInitiator = false; // Reset state
-  console.log("Session terminated.");
+  console.log("Session terminated and signals cleared.");
 }
 
-// --- Signaling with Deno KV (via server.js) ---
 
 async function sendSignalMessage(type, payload) {
   try {
-    console.log(`Sending signal: ${type}`, payload);
+    // console.log(`Sending signal: ${type}`, payload); // Full payload can be verbose for candidates
+    console.log(`Sending signal type: ${type} to /signal`);
     const response = await fetch(`/signal?room=${ROOM_ID}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ type: type, payload: payload }), // Ensure payload is wrapped
+      body: JSON.stringify({ type: type, payload: payload }), 
     });
     if (!response.ok) {
       console.error(
@@ -256,7 +303,8 @@ async function sendSignalMessage(type, payload) {
         await response.text(),
       );
     }
-  } catch (error) {
+  } catch (error)
+ {
     console.error(`Error sending signal message ${type}:`, error);
   }
 }
@@ -265,22 +313,22 @@ async function getSignalMessage(type) {
   try {
     const response = await fetch(`/signal?room=${ROOM_ID}&type=${type}`);
     if (response.ok) {
-      const data = await response.json(); // Server should return { type, payload } or null/empty for no data
-      console.log(`Received signal for ${type}:`, data);
-      return data; // Return the whole { type, payload } object or null
+      const data = await response.json(); 
+      console.log(`Received signal for ${type} from /signal:`, data ? data.type : 'null');
+      return data; 
     }
     if (response.status === 404) {
-      console.log(`No signal message of type ${type} found.`);
+      console.log(`No signal message of type ${type} found on server (404).`);
       return null;
     }
     console.error(
-      `Failed to get signal message ${type}:`,
+      `Failed to get signal message ${type} from server:`,
       response.status,
       await response.text(),
     );
     return null;
   } catch (error) {
-    console.error(`Error getting signal message ${type}:`, error);
+    console.error(`Error fetching signal message ${type} from server:`, error);
     return null;
   }
 }
@@ -291,16 +339,15 @@ async function pollForSignalMessages() {
     peerConnection.signalingState === "closed" ||
     hangupButton.disabled
   ) {
-    return; // Stop polling if connection is closed or session ended
+    return; 
   }
 
   try {
-    // Initiator looks for an answer and receiver's candidates
     if (isInitiator) {
       if (!peerConnection.remoteDescription) {
         const answerSignal = await getSignalMessage("answer");
         if (answerSignal && answerSignal.payload) {
-          console.log("Received answer:", answerSignal.payload);
+          console.log("Initiator received answer:", answerSignal.payload.type);
           await peerConnection.setRemoteDescription(
             new RTCSessionDescription(answerSignal.payload),
           );
@@ -309,28 +356,37 @@ async function pollForSignalMessages() {
       }
       const candidateSignal = await getSignalMessage("candidate_receiver");
       if (candidateSignal && candidateSignal.payload) {
-        console.log("Received candidate_receiver:", candidateSignal.payload);
-        await peerConnection.addIceCandidate(
-          new RTCIceCandidate(candidateSignal.payload),
-        );
-        // await clearSignalMessage("candidate_receiver"); // TEMPORARILY COMMENTED OUT
+        console.log("Initiator received candidate_receiver signal payload:", JSON.stringify(candidateSignal.payload));
+        if (candidateSignal.payload.candidate) { // Check for actual candidate string
+          console.log("Initiator adding ICE candidate:", candidateSignal.payload.candidate.substring(0,70) + "...");
+          await peerConnection.addIceCandidate(
+            new RTCIceCandidate(candidateSignal.payload),
+          );
+          // await clearSignalMessage("candidate_receiver"); // TEMPORARILY COMMENTED OUT
+        } else {
+          console.warn("Initiator received candidate_receiver signal, but payload.candidate is empty. Skipping addIceCandidate.", candidateSignal.payload);
+        }
       }
     } else {
-      // Receiver looks for initiator's candidates
+      // Receiver looks for initiator\'s candidates
       const candidateSignal = await getSignalMessage("candidate_initiator");
       if (candidateSignal && candidateSignal.payload) {
-        console.log("Received candidate_initiator:", candidateSignal.payload);
-        await peerConnection.addIceCandidate(
-          new RTCIceCandidate(candidateSignal.payload),
-        );
-        // await clearSignalMessage("candidate_initiator"); // TEMPORARILY COMMENTED OUT
+        console.log("Receiver received candidate_initiator signal payload:", JSON.stringify(candidateSignal.payload));
+        if (candidateSignal.payload.candidate) { // Check for actual candidate string
+          console.log("Receiver adding ICE candidate:", candidateSignal.payload.candidate.substring(0,70) + "...");
+          await peerConnection.addIceCandidate(
+            new RTCIceCandidate(candidateSignal.payload),
+          );
+          // await clearSignalMessage("candidate_initiator"); // TEMPORARILY COMMENTED OUT
+        } else {
+          console.warn("Receiver received candidate_initiator signal, but payload.candidate is empty. Skipping addIceCandidate.", candidateSignal.payload);
+        }
       }
     }
   } catch (error) {
     console.error("Error polling for signal messages:", error);
   }
 
-  // Poll again after a short delay
   if (
     peerConnection &&
     peerConnection.signalingState !== "closed" &&
@@ -342,22 +398,21 @@ async function pollForSignalMessages() {
 
 async function clearSignalMessage(type) {
   try {
-    console.log(`Clearing signal: ${type}`);
+    console.log(`Requesting to clear signal type: ${type} on server.`);
     const response = await fetch(`/signal?room=${ROOM_ID}&type=${type}`, {
       method: "DELETE",
     });
     if (!response.ok && response.status !== 404) {
-      // 404 is fine if already deleted
       console.error(
-        `Failed to clear signal message ${type}:`,
+        `Failed to clear signal message ${type} on server:`,
         response.status,
         await response.text(),
       );
     } else {
-      console.log(`Signal message ${type} cleared or was not present.`);
+      console.log(`Signal message ${type} cleared on server (or was not present).`);
     }
   } catch (error) {
-    console.error(`Error clearing signal message ${type}:`, error);
+    console.error(`Error clearing signal message ${type} on server:`, error);
   }
 }
 
@@ -366,4 +421,4 @@ hangupButton.disabled = true;
 chatInput.disabled = true;
 sendButton.disabled = true;
 
-console.log("Client script loaded. Waiting for user to start session.");
+console.log("Client script loaded. Ready for user to start session.");
